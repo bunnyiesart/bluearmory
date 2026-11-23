@@ -29,6 +29,86 @@ def _client() -> httpx.Client:
     )
 
 
+# ── Internals ──────────────────────────────────────────────────────────────
+
+
+def _check(r: httpx.Response) -> None:
+    """Raise with the Graylog error body attached.
+
+    httpx's raise_for_status() discards the response body, which is where
+    Graylog explains itself (missing permission, validation failure). Losing
+    it turns every failure into a bare status code.
+    """
+    if r.is_error:
+        raise RuntimeError(
+            f"Graylog {r.status_code} on {r.request.method} "
+            f"{r.request.url.path}: {r.text[:600]}"
+        )
+
+
+def _rows_to_messages(payload: dict) -> dict:
+    """Flatten a Scripting API result into a list of message dicts.
+
+    /search/messages answers with a column schema plus positional rows:
+        {"schema": [{"field": "timestamp"}, ...], "datarows": [[v1, v2], ...]}
+    Callers want records, so zip the two back together.
+    """
+    schema = payload.get("schema") or []
+    names = [s.get("field") or s.get("name") for s in schema]
+    rows = payload.get("datarows") or []
+    messages = [dict(zip(names, row)) for row in rows]
+    return {
+        "messages": messages,
+        "fields": names,
+        # The Scripting API reports no grand total for message queries, so this
+        # is the size of THIS page, never the number of matches. When it equals
+        # the requested limit the result is probably truncated -- say so rather
+        # than let a caller read a page size as a population count.
+        "returned": len(messages),
+        "effective_timerange": (payload.get("metadata") or {}).get(
+            "effective_timerange", {}
+        ),
+    }
+
+
+# Legacy /search/universal/* returned every field when none were named. The
+# Scripting API instead defaults to source+timestamp, which silently drops the
+# payload. `message` carries the raw log line, so this default keeps the whole
+# event reachable when a caller names no fields.
+_DEFAULT_FIELDS = ["timestamp", "source", "message"]
+
+
+def _search_messages(
+    query: str,
+    timerange: dict,
+    limit: int,
+    fields: str,
+    stream_id: str,
+) -> dict:
+    """Run one message search against the Scripting API.
+
+    Replaces /search/universal/*, which exists on Graylog 7.x but is authorized
+    by searches:{relative,absolute,keyword} -- permissions no default role
+    grants, so it answers 403. This route authorizes by streams:read plus
+    messages:read instead.
+    """
+    named = [f.strip() for f in fields.split(",") if f.strip()] if fields else []
+    body: dict = {
+        "query": query or "*",
+        "timerange": timerange,
+        "fields": named or _DEFAULT_FIELDS,
+        "size": limit,
+        "sort": "timestamp",
+        "sort_order": "Descending",
+    }
+    if stream_id:
+        body["streams"] = [stream_id]
+    with _client() as c:
+        r = c.post("/search/messages", json=body)
+        _check(r)
+        return _rows_to_messages(r.json())
+
+
 # ── Search ─────────────────────────────────────────────────────────────────
 
 
@@ -46,18 +126,12 @@ def search_relative(
         query: Graylog search query (Lucene syntax)
         range_seconds: How far back to search in seconds (default: 300 = 5 minutes)
         limit: Maximum number of results (default: 50)
-        fields: Comma-separated list of fields to return (empty = all)
+        fields: Comma-separated list of fields to return (empty = timestamp, source, message)
         stream_id: Limit search to a specific stream ID (optional)
     """
-    params = {"query": query, "range": range_seconds, "limit": limit}
-    if fields:
-        params["fields"] = fields
-    if stream_id:
-        params["filter"] = f"streams:{stream_id}"
-    with _client() as c:
-        r = c.get("/search/universal/relative", params=params)
-        r.raise_for_status()
-        return r.json()
+    return _search_messages(
+        query, {"type": "relative", "range": range_seconds}, limit, fields, stream_id
+    )
 
 
 @mcp.tool()
@@ -76,18 +150,16 @@ def search_absolute(
         from_time: Start time (ISO 8601, e.g. 2024-01-15T10:00:00.000Z)
         to_time: End time (ISO 8601)
         limit: Maximum number of results (default: 50)
-        fields: Comma-separated list of fields to return (empty = all)
+        fields: Comma-separated list of fields to return (empty = timestamp, source, message)
         stream_id: Limit search to a specific stream ID (optional)
     """
-    params = {"query": query, "from": from_time, "to": to_time, "limit": limit}
-    if fields:
-        params["fields"] = fields
-    if stream_id:
-        params["filter"] = f"streams:{stream_id}"
-    with _client() as c:
-        r = c.get("/search/universal/absolute", params=params)
-        r.raise_for_status()
-        return r.json()
+    return _search_messages(
+        query,
+        {"type": "absolute", "from": from_time, "to": to_time},
+        limit,
+        fields,
+        stream_id,
+    )
 
 
 @mcp.tool()
@@ -104,18 +176,12 @@ def search_keyword(
         query: Graylog search query (Lucene syntax)
         keyword: Natural language time range (e.g. "last 1 hour", "yesterday")
         limit: Maximum number of results (default: 50)
-        fields: Comma-separated list of fields to return (empty = all)
+        fields: Comma-separated list of fields to return (empty = timestamp, source, message)
         stream_id: Limit search to a specific stream ID (optional)
     """
-    params = {"query": query, "keyword": keyword, "limit": limit}
-    if fields:
-        params["fields"] = fields
-    if stream_id:
-        params["filter"] = f"streams:{stream_id}"
-    with _client() as c:
-        r = c.get("/search/universal/keyword", params=params)
-        r.raise_for_status()
-        return r.json()
+    return _search_messages(
+        query, {"type": "keyword", "keyword": keyword}, limit, fields, stream_id
+    )
 
 
 @mcp.tool()
@@ -130,6 +196,63 @@ def get_message(message_id: str, index: str) -> dict:
         r = c.get(f"/messages/{index}/{message_id}")
         r.raise_for_status()
         return r.json()
+
+
+@mcp.tool()
+def search_aggregate(
+    query: str,
+    group_by: str,
+    range_seconds: int = 3600,
+    from_time: str = "",
+    to_time: str = "",
+    stream_id: str = "",
+) -> dict:
+    """Count messages grouped by one or more fields.
+
+    Use this instead of search_relative when the question is "how many", not
+    "show me". /search/messages reports no grand total, so counting by hand from
+    a capped page silently undercounts.
+
+    Args:
+        query: Graylog search query (Lucene syntax)
+        group_by: Comma-separated fields to group by (e.g. "host,response_http_code")
+        range_seconds: How far back to search in seconds (default: 3600); ignored when from_time is given
+        from_time: Absolute start (ISO 8601). Overrides range_seconds when set, requires to_time
+        to_time: Absolute end (ISO 8601)
+        stream_id: Limit to a specific stream ID (optional)
+    """
+    groups = [g.strip() for g in group_by.split(",") if g.strip()]
+    if not groups:
+        raise ValueError("group_by needs at least one field name")
+    if from_time and to_time:
+        timerange = {"type": "absolute", "from": from_time, "to": to_time}
+    else:
+        timerange = {"type": "relative", "range": range_seconds}
+    body: dict = {
+        "query": query or "*",
+        "timerange": timerange,
+        "group_by": [{"field": g} for g in groups],
+        "metrics": [{"function": "count"}],
+    }
+    if stream_id:
+        body["streams"] = [stream_id]
+    with _client() as c:
+        # This endpoint rejects unknown properties (no `size`, no `limit`) and
+        # names the ones it knows in the 400 body, which _check now surfaces.
+        r = c.post("/search/aggregate", json=body)
+        _check(r)
+        payload = r.json()
+    schema = payload.get("schema") or []
+    names = [s.get("field") or s.get("function") or s.get("name") for s in schema]
+    rows = payload.get("datarows") or []
+    return {
+        "columns": names,
+        "rows": [dict(zip(names, row)) for row in rows],
+        "groups": len(rows),
+        "effective_timerange": (payload.get("metadata") or {}).get(
+            "effective_timerange", {}
+        ),
+    }
 
 
 # ── Streams ────────────────────────────────────────────────────────────────
@@ -219,5 +342,24 @@ def list_inputs() -> dict:
         return r.json()
 
 
+# The transport is env-selectable so the same server runs as a local stdio child
+# (the default, byte-for-byte the previous behaviour) or over streamable-HTTP so
+# it can be served behind a gateway. HTTP exposes the tools to any client that can
+# reach the socket; the default bind is loopback and no shared secret is enforced,
+# so HTTP must sit behind an authenticating proxy before binding a routable address.
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    elif transport == "http":
+        mcp.settings.host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1").strip()
+        port_raw = os.environ.get("MCP_HTTP_PORT", "8080").strip()
+        try:
+            mcp.settings.port = int(port_raw)
+        except ValueError:
+            raise SystemExit(f"MCP_HTTP_PORT={port_raw!r} is not an integer.")
+        mcp.run(transport="streamable-http")
+    else:
+        raise SystemExit(
+            f"MCP_TRANSPORT={transport!r} is not supported; use 'stdio' or 'http'."
+        )
