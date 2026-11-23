@@ -285,6 +285,17 @@ if __name__ == "__main__":
             mcp.settings.port = int(port_raw)
         except ValueError:
             raise SystemExit(f"MCP_HTTP_PORT={port_raw!r} is not an integer.")
+        allowed = os.environ.get("MCP_HTTP_ALLOWED_HOSTS", "").strip()
+        if allowed:
+            from mcp.server.transport_security import TransportSecuritySettings
+
+            hosts = [h.strip() for h in allowed.split(",") if h.strip()]
+            origins = []
+            for h in hosts:
+                origins += [f"http://{h}", f"https://{h}"]
+            mcp.settings.transport_security = TransportSecuritySettings(
+                allowed_hosts=hosts, allowed_origins=origins
+            )
         mcp.run(transport="streamable-http")
     else:
         raise SystemExit(
